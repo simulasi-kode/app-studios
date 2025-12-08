@@ -1,17 +1,21 @@
-// Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
+import { initializeApp, getApps, getApp } from "firebase/app";
 
-// Your web app's Firebase configuration
-const firebaseConfig = {
-  apiKey: "AIzaSyBOP3UhZ2B-7naisuTn1JDfqHGbZ8HmzM8",
-  authDomain: "studios-9c34c.firebaseapp.com",
-  projectId: "studios-9c34c",
-  storageBucket: "studios-9c34c.firebasestorage.app",
-  messagingSenderId: "228696722817",
-  appId: "1:228696722817:web:72d572a227fd49fb40ec80"
+const clientConfig = {
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
+  authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+  measurementId: process.env.NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID,
 };
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
+export function initFirebaseClient() {
+  // initialize the firebase app only once
+  if (!getApps().length) {
+    initializeApp(clientConfig);
+  } else {
+    // ensure we return an existing app
+    getApp();
+  }
+}
