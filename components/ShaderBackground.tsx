@@ -3,129 +3,89 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 
-/*
-  Replacement ShaderBackground:
-  - Renders your procedural shader into a low-res WebGLRenderTarget
-  - Reads pixels (Uint8Array) from the renderTarget
-  - Applies Floyd–Steinberg error diffusion per-channel (configurable quantization)
-  - Writes the processed pixels into an offscreen 2D canvas and upscales that canvas to fill the screen
-  - Uses CSS image-rendering: pixelated to keep blocky pixels
-
-  Notes:
-  - readRenderTargetPixels is synchronous and can be expensive; keep the low-res target small (e.g. 160-480 px tall depending on desired block size).
-  - Throttle or skip frames if you need to reduce CPU usage.
-*/
-
-export default function ShaderBackground() {
+export default function BWDitheredGradient({
+  lowRes = 480,
+  targetFps = 60,
+  motionAmp = 1.5,
+  motionSpeed = 1.0,
+  noiseStrength = 1.5, // ↓ slightly reduced for smoother pattern
+  gradientTop = 0.018,
+  gradientBottom = 0.55,
+}) {
   const mountRef = useRef<HTMLDivElement>(null);
-  const outCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
-    if (!mountRef.current) return;
+    const parent = mountRef.current!;
+    parent.innerHTML = "";
 
-    const width = window.innerWidth;
-    const height = window.innerHeight;
+    const screenW = window.innerWidth;
+    const screenH = window.innerHeight;
 
-    // -----------------------------
-    // Scene + Camera
-    // -----------------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setSize(screenW, screenH);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    parent.appendChild(renderer.domElement);
+
     const scene = new THREE.Scene();
     const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
-    // -----------------------------
-    // Renderer
-    // -----------------------------
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setSize(width, height);
-    renderer.setPixelRatio(window.devicePixelRatio);
-    // Keep the three canvas hidden: we'll copy processed pixels to a 2D canvas
-    renderer.domElement.style.display = "none";
-    mountRef.current.appendChild(renderer.domElement);
-
-    // -----------------------------
-    // Output canvas that will be visible and pixelated
-    // -----------------------------
-    const outCanvas = document.createElement("canvas");
-    outCanvas.style.position = "fixed";
-    outCanvas.style.inset = "0";
-    outCanvas.style.width = "100%";
-    outCanvas.style.height = "100%";
-    outCanvas.style.pointerEvents = "none";
-    // pixelated scaling for crisp blocks
-    (outCanvas.style as any).imageRendering = "pixelated";
-    outCanvasRef.current = outCanvas;
-    mountRef.current.appendChild(outCanvas);
-
-    // -----------------------------
-    // Detect Dark Mode
-    // -----------------------------
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const isDark = media.matches;
-
-    // -----------------------------
-    // Fullscreen Quad geometry
-    // -----------------------------
     const geometry = new THREE.PlaneGeometry(2, 2);
 
-    // -----------------------------
-    // Shader Material (same logic as your shader, with uniforms)
-    // -----------------------------
+    const colorTop = new THREE.Color(0x151515);
+    const colorBottom = new THREE.Color(0xffffff);
+
     const material = new THREE.ShaderMaterial({
       uniforms: {
-        u_resolution: { value: new THREE.Vector2(width, height) },
-        u_time: { value: 0.0 },
+        u_resolution: { value: new THREE.Vector2(screenW, screenH) },
+        u_time: { value: 0 },
 
-        u_dotsize: { value: 2.5 },
+        u_colorTop: { value: colorTop },
+        u_colorBottom: { value: colorBottom },
 
-        u_colorTop: {
-          value: isDark ? new THREE.Color("#000000") : new THREE.Color("#ffffff"),
-        },
-        u_colorBottom: {
-          value: isDark ? new THREE.Color("#ffffff") : new THREE.Color("#1b1b1b"),
-        },
+        u_motionAmp: { value: motionAmp },
+        u_motionSpeed: { value: motionSpeed },
+        u_noiseStrength: { value: noiseStrength },
 
-        u_invert: { value: isDark ? 0.0 : 1.0 },
-
-        u_noiseStrength: { value: 0.20 },
-        u_motionStrength: { value: 0.15 },
-        u_grainStrength: { value: 0.05 },
-
-        u_speed_scan: { value: 0.5 },
-        u_speed_wobble: { value: 0.1 },
-        u_speed_tear: { value: 0.25 },
-        u_speed_noise: { value: 0.3 },
-        u_speed_snow: { value: 0.4 },
-        u_speed_flicker: { value: 1.0 },
+        u_top: { value: gradientTop },
+        u_bottom: { value: gradientBottom },
       },
 
+      // ---------------------------
+      // VERTEX SHADER
+      // ---------------------------
       vertexShader: `
+        varying vec2 vUv;
         void main() {
+          vUv = uv;
           gl_Position = vec4(position, 1.0);
         }
       `,
 
+      // ---------------------------
+      // FRAGMENT SHADER
+      // (Improved smoothness)
+      // ---------------------------
       fragmentShader: `
         precision highp float;
 
         uniform vec2 u_resolution;
         uniform float u_time;
-        uniform float u_dotsize;
 
         uniform vec3 u_colorTop;
         uniform vec3 u_colorBottom;
-        uniform float u_invert;
 
+        uniform float u_motionAmp;
+        uniform float u_motionSpeed;
         uniform float u_noiseStrength;
-        uniform float u_motionStrength;
-        uniform float u_grainStrength;
 
-        uniform float u_speed_scan;
-        uniform float u_speed_wobble;
-        uniform float u_speed_tear;
-        uniform float u_speed_noise;
-        uniform float u_speed_snow;
-        uniform float u_speed_flicker;
+        uniform float u_top;
+        uniform float u_bottom;
 
+        varying vec2 vUv;
+
+        // -----------------------------
+        // HASH & BASIC NOISE
+        // -----------------------------
         float hash(vec2 p) {
           return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
         }
@@ -140,58 +100,46 @@ export default function ShaderBackground() {
           float d = hash(i + vec2(1.0, 1.0));
 
           vec2 u = f * f * (3.0 - 2.0 * f);
-          return mix(a, b, u.x)
-               + (c - a) * u.y * (1.0 - u.x)
-               + (d - b) * u.x * u.y;
-        }
 
-        float bayer(vec2 uv) {
-          int x = int(mod(uv.x, 4.0));
-          int y = int(mod(uv.y, 4.0));
-          int idx = y * 4 + x;
-
-          float m[16];
-          m[0]=0.0; m[1]=8.0; m[2]=2.0; m[3]=10.0;
-          m[4]=12.0; m[5]=4.0; m[6]=14.0; m[7]=6.0;
-          m[8]=3.0; m[9]=11.0; m[10]=1.0; m[11]=9.0;
-          m[12]=15.0; m[13]=7.0; m[14]=13.0; m[15]=5.0;
-
-          return m[idx] / 16.0;
+          return mix(a, b, u.x) +
+                 (c - a) * u.y * (1.0 - u.x) +
+                 (d - b) * u.x * u.y;
         }
 
         void main() {
+
+          // --------------------------------------
+          // Normalize to 0–1 screen UV
+          // --------------------------------------
           vec2 uv = gl_FragCoord.xy / u_resolution.xy;
 
-          float scan = sin(uv.y * 200.0 + u_time * u_speed_scan) * 0.0001;
-          uv.x += scan;
+          // -----------------------------------------------------
+          // IMPROVED NOISE (lower freq = smoother)
+          // -----------------------------------------------------
+          float n1 = noise(uv * 15.0 + u_time * 0.4);   // ↓ reduced from 50
+          float n2 = noise(uv * 35.0 + u_time * 0.25);  // ↓ reduced from 90
 
-          float wobble = sin(uv.y * 30.0 + u_time * u_speed_wobble) * 0.001;
-          uv.x += wobble;
+          float combinedNoise =
+              (n1 - 0.5) * 0.55 +
+              (n2 - 0.5) * 0.45;
 
-          float tearTrigger = step(0.98, fract(u_time * u_speed_tear));
-          uv.y = mod(uv.y + tearTrigger * 0.08, 1.0);
+          // -----------------------------------------------------
+          // VERTICAL GRADIENT  (smooth before dither)
+          // -----------------------------------------------------
+          float g = (uv.y - u_top) / (u_bottom - u_top);
 
-          float g = uv.y;
+          // subtle movement
+          g += combinedNoise * (u_noiseStrength * 0.6);
 
-          float organic = noise(uv * 3.0 + u_time * u_speed_noise);
-          float n = (organic - 0.5) * u_noiseStrength;
+          // soften gradient to avoid hard dither edges
+          g = smoothstep(0.0, 1.0, g);
 
-          float snow = hash(gl_FragCoord.xy * (u_time * u_speed_snow)) * 0.4;
+          g = clamp(g, 0.0, 1.0);
 
-          float grain = hash(gl_FragCoord.xy * u_time) * u_grainStrength;
+          // final black → white mapping
+          vec3 col = mix(u_colorTop, u_colorBottom, g);
 
-          float flick = sin(u_time * u_speed_flicker) * 0.10;
-
-          float shade = g + n * u_motionStrength + grain + snow + flick;
-
-          float threshold = bayer(gl_FragCoord.xy / u_dotsize);
-          float bw = shade > threshold ? 0.0 : 1.0;
-
-          if (u_invert > 0.5) bw = 1.0 - bw;
-
-          vec3 finalColor = mix(u_colorTop, u_colorBottom, bw);
-
-          gl_FragColor = vec4(finalColor, 1.0);
+          gl_FragColor = vec4(col, 1.0);
         }
       `,
     });
@@ -199,214 +147,131 @@ export default function ShaderBackground() {
     const mesh = new THREE.Mesh(geometry, material);
     scene.add(mesh);
 
-    // -----------------------------
-    // Low-res render target settings for CPU error-diffusion
-    // -----------------------------
-    // Use dotsize to compute low-res size; bigger dotsize -> smaller renderTarget -> bigger blocks
-    function makeTargetSize(w: number, h: number, dotsize: number) {
-      // choose a scale factor; you can tweak this formula to taste
-      const scale = Math.max(1, Math.floor(dotsize)); // user-facing dotsize
-      const tw = Math.max(2, Math.floor(w / scale));
-      const th = Math.max(2, Math.floor(h / scale));
-      return { tw, th };
-    }
+    // ---------------------------------------------
+    // LOW RES DITHER TARGET (unchanged)
+    // ---------------------------------------------
+    const tw = Math.round((screenW / screenH) * lowRes);
+    const th = lowRes;
 
-    let { tw: targetW, th: targetH } = makeTargetSize(width, height, material.uniforms.u_dotsize.value);
-
-    const target = new THREE.WebGLRenderTarget(targetW, targetH, {
+    const target = new THREE.WebGLRenderTarget(tw, th, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       format: THREE.RGBAFormat,
-      type: THREE.UnsignedByteType,
-      depthBuffer: false,
-      stencilBuffer: false,
     });
 
-    // 2D canvas to draw processed pixels (low-res) and it will be CSS-scaled
-    const outCtx = outCanvas.getContext("2d", { alpha: false })!;
-    outCanvas.width = targetW;
-    outCanvas.height = targetH;
+    const outCanvas = document.createElement("canvas");
+    const outCtx = outCanvas.getContext("2d")!;
+    outCanvas.width = tw;
+    outCanvas.height = th;
 
-    // CSS scaling is handled by setting the canvas CSS width/height to screen size already above
+    outCanvas.style.width = "100%";
+    outCanvas.style.height = "100%";
+    outCanvas.style.position = "fixed";
+    outCanvas.style.top = "0";
+    outCanvas.style.left = "0";
 
-    // processing buffers
-    const pixelBuf = new Uint8Array(targetW * targetH * 4);
+    parent.appendChild(outCanvas);
 
-    // quantization settings: for an 8-bit "3-3-2" palette you can use:
-    const levelsR = 8; // 3 bits
-    const levelsG = 8; // 3 bits
-    const levelsB = 4; // 2 bits
+    const pixelBuf = new Uint8Array(tw * th * 4);
 
-    // To reduce CPU load we can process less often (throttle). Set to 1 for every frame.
-    const framesBetweenProcess = 1;
-    let frameCounter = 0;
+    // ----------------------------
+    // DITHER (unchanged)
+    // ----------------------------
+    function dither(buf: Uint8Array, w: number, h: number) {
+      const r = new Float32Array(w * h);
+      const g = new Float32Array(w * h);
+      const b = new Float32Array(w * h);
 
-    // Floyd–Steinberg (per-channel) on a float buffer
-    function floydSteinbergRGBA(buf: Uint8Array, w: number, h: number) {
-      const n = w * h;
-      const r = new Float32Array(n);
-      const g = new Float32Array(n);
-      const b = new Float32Array(n);
-
-      // fill float buffers
-      for (let i = 0; i < n; i++) {
+      for (let i = 0; i < w * h; i++) {
         r[i] = buf[i * 4 + 0];
         g[i] = buf[i * 4 + 1];
         b[i] = buf[i * 4 + 2];
       }
 
-      const qR = 255 / (levelsR - 1);
-      const qG = 255 / (levelsG - 1);
-      const qB = 255 / (levelsB - 1);
-
       for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
-          const idx = y * w + x;
+          const i = y * w + x;
 
-          // R channel
-          const oldR = r[idx];
-          const newR = Math.round(oldR / qR) * qR;
-          const errR = oldR - newR;
-          r[idx] = newR;
+          const nr = r[i] < 128 ? 0 : 255;
+          const ng = g[i] < 128 ? 0 : 255;
+          const nb = b[i] < 128 ? 0 : 255;
 
-          // G
-          const oldG = g[idx];
-          const newG = Math.round(oldG / qG) * qG;
-          const errG = oldG - newG;
-          g[idx] = newG;
+          const er = r[i] - nr;
+          const eg = g[i] - ng;
+          const eb = b[i] - nb;
 
-          // B
-          const oldB = b[idx];
-          const newB = Math.round(oldB / qB) * qB;
-          const errB = oldB - newB;
-          b[idx] = newB;
+          r[i] = nr; g[i] = ng; b[i] = nb;
 
-          // distribute errors
-          // right
-          if (x + 1 < w) {
-            const idxr = idx + 1;
-            r[idxr] += errR * (7 / 16);
-            g[idxr] += errG * (7 / 16);
-            b[idxr] += errB * (7 / 16);
-          }
-          // bottom-left
-          if (x - 1 >= 0 && y + 1 < h) {
-            const idxbl = idx + w - 1;
-            r[idxbl] += errR * (3 / 16);
-            g[idxbl] += errG * (3 / 16);
-            b[idxbl] += errB * (3 / 16);
-          }
-          // bottom
-          if (y + 1 < h) {
-            const idxb = idx + w;
-            r[idxb] += errR * (5 / 16);
-            g[idxb] += errG * (5 / 16);
-            b[idxb] += errB * (5 / 16);
-          }
-          // bottom-right
-          if (x + 1 < w && y + 1 < h) {
-            const idxbr = idx + w + 1;
-            r[idxbr] += errR * (1 / 16);
-            g[idxbr] += errG * (1 / 16);
-            b[idxbr] += errB * (1 / 16);
-          }
+          const spread = (dx: number, dy: number, factor: number) => {
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+              const ni = ny * w + nx;
+              r[ni] += er * factor;
+              g[ni] += eg * factor;
+              b[ni] += eb * factor;
+            }
+          };
+
+          spread(1, 0, 7 / 16);
+          spread(-1, 1, 3 / 16);
+          spread(0, 1, 5 / 16);
+          spread(1, 1, 1 / 16);
         }
       }
 
-      // write back to byte buffer
-      for (let i = 0; i < n; i++) {
-        buf[i * 4 + 0] = Math.max(0, Math.min(255, Math.round(r[i])));
-        buf[i * 4 + 1] = Math.max(0, Math.min(255, Math.round(g[i])));
-        buf[i * 4 + 2] = Math.max(0, Math.min(255, Math.round(b[i])));
-        buf[i * 4 + 3] = 255; // alpha
+      for (let i = 0; i < w * h; i++) {
+        buf[i * 4 + 0] = r[i];
+        buf[i * 4 + 1] = g[i];
+        buf[i * 4 + 2] = b[i];
+        buf[i * 4 + 3] = 255;
       }
     }
 
-    // Animation loop: render to renderTarget, read pixels, apply FS, put to 2D canvas
-    let mounted = true;
+    // ---------------------------
+    // MAIN LOOP
+    // ---------------------------
+    let rafId = 0;
+    let lastFrame = 0;
+    const frameInterval = 1000 / targetFps;
 
-    const animate = (t: number) => {
-      if (!mounted) return;
-
+    const loop = (t: number) => {
       material.uniforms.u_time.value = t * 0.001;
-      material.uniforms.u_resolution.value.set(width, height);
 
-      // render into low-res target
       renderer.setRenderTarget(target);
       renderer.render(scene, camera);
-      renderer.setRenderTarget(null);
 
-      // throttle processing
-      frameCounter = (frameCounter + 1) % framesBetweenProcess;
-      if (frameCounter === 0) {
-        // readTargetPixels synchronous call
-        try {
-          renderer.readRenderTargetPixels(target, 0, 0, targetW, targetH, pixelBuf);
-        } catch (e) {
-          // Some contexts may throw if readRenderTargetPixels is unsupported; handle gracefully.
-          // In that case, skip processing this frame.
-          console.warn("readRenderTargetPixels failed:", e);
-          requestAnimationFrame(animate);
-          return;
-        }
+      if (t - lastFrame >= frameInterval) {
+        lastFrame = t;
 
-        // apply Floyd–Steinberg diffusion per-channel
-        floydSteinbergRGBA(pixelBuf, targetW, targetH);
+        renderer.readRenderTargetPixels(target, 0, 0, tw, th, pixelBuf);
+        dither(pixelBuf, tw, th);
 
-        // draw to outCanvas 2D
-        const imageData = new ImageData(new Uint8ClampedArray(pixelBuf.buffer), targetW, targetH);
-        outCtx.putImageData(imageData, 0, 0);
+        const imgData = new ImageData(new Uint8ClampedArray(pixelBuf), tw, th);
+        outCtx.putImageData(imgData, 0, 0);
       }
 
-      requestAnimationFrame(animate);
+      rafId = requestAnimationFrame(loop);
     };
-    animate(0);
 
-    // Resize handler (resizes renderTarget + outCanvas)
-    const onResize = () => {
-      const w = window.innerWidth;
-      const h = window.innerHeight;
-      // recompute low-res target size
-      const ds = material.uniforms.u_dotsize.value;
-      const sizes = makeTargetSize(w, h, ds);
-      targetW = sizes.tw;
-      targetH = sizes.th;
+    rafId = requestAnimationFrame(loop);
 
-      // dispose old target and create a replacement with new size
-      target.dispose();
-      const newTarget = new THREE.WebGLRenderTarget(targetW, targetH, {
-        minFilter: THREE.NearestFilter,
-        magFilter: THREE.NearestFilter,
-        format: THREE.RGBAFormat,
-        type: THREE.UnsignedByteType,
-        depthBuffer: false,
-        stencilBuffer: false,
-      });
-      // copy newTarget into variable used in animate (hacky but fine in this closure)
-      (target as any) = newTarget;
-
-      outCanvas.width = targetW;
-      outCanvas.height = targetH;
-      outCanvas.style.width = `${w}px`;
-      outCanvas.style.height = `${h}px`;
-
-      renderer.setSize(w, h);
-      material.uniforms.u_resolution.value.set(w, h);
-    };
-    window.addEventListener("resize", onResize);
-
-    // cleanup
     return () => {
-      mounted = false;
-      window.removeEventListener("resize", onResize);
-      mountRef.current?.removeChild(renderer.domElement);
-      mountRef.current?.removeChild(outCanvas);
+      cancelAnimationFrame(rafId);
       renderer.dispose();
       target.dispose();
+      parent.innerHTML = "";
     };
-  }, []);
+  }, [
+    lowRes,
+    targetFps,
+    motionAmp,
+    motionSpeed,
+    noiseStrength,
+    gradientTop,
+    gradientBottom,
+  ]);
 
-  return (
-    <div ref={mountRef} className="fixed inset-0 -z-50 pointer-events-none" />
-  );
+  return <div ref={mountRef} className="fixed inset-0 -z-50" />;
 }
+

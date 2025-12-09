@@ -26,10 +26,10 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased relative min-h-screen`}
+        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <ShaderBackground />
-        <main className="relative z-10">
+        <main className="relative z-0">
           {children}
         </main>
       </body>
